@@ -25,12 +25,18 @@ const { useState, useEffect, useMemo } = React;
 /* ---------------------------------------------------------------------------
    Defaults (persisted config). Structured so margin/pricing logic can be
    layered on later without restructuring the cost engine.
+
+   Phase billing flags:
+   - packageScoped : campaign mode → once per package; per-visual mode → per image
+   - perImage      : always per image (every visual)
+   - hiresOnly     : per Hires image only
 --------------------------------------------------------------------------- */
 const DEFAULT_CONFIG = {
   usd_to_idr: 18000,
   price_buffer_multiplier: 1.5,
   base_hourly_rate_idr: 50000,
   rate_selection: "max_of_mean_median",
+  campaign_package_size: 10,
   engines: {
     generating: [
       { name: "Grok", usd: 0.020 },
@@ -48,14 +54,14 @@ const DEFAULT_CONFIG = {
     ],
   },
   phases: [
-    { id: "creative",  name: "Creative Conception", genMin: 100, genMax: 250, group: "generating", hrsMin: 4,  hrsMax: 10, scope: "campaign",   hourlyMult: 1.25 },
-    { id: "revision",  name: "Concept Revision",    genMin: 50,  genMax: 125, group: "generating", hrsMin: 8,  hrsMax: 12, scope: "campaign",   hourlyMult: 1.00 },
-    { id: "prompting", name: "Prompting Day",       genMin: 200, genMax: 400, group: "generating", hrsMin: 4,  hrsMax: 10, scope: "campaign",   hourlyMult: 1.00, scopeToggle: true },
-    { id: "touchup",   name: "Touch Up / Upscale",  genMin: 100, genMax: 300, group: "upscaling",  hrsMin: 10, hrsMax: 10, scope: "per_visual", hourlyMult: 1.00, hiresOnly: true },
+    { id: "creative",  name: "Creative Conception", genMin: 100, genMax: 250, group: "generating", hrsMin: 4,  hrsMax: 10, hourlyMult: 1.25, packageScoped: true },
+    { id: "revision",  name: "Concept Revision",    genMin: 50,  genMax: 125, group: "generating", hrsMin: 8,  hrsMax: 12, hourlyMult: 1.00, packageScoped: true },
+    { id: "prompting", name: "Prompting Day",       genMin: 200, genMax: 400, group: "generating", hrsMin: 4,  hrsMax: 10, hourlyMult: 1.00, perImage: true },
+    { id: "touchup",   name: "Touch Up / Upscale",  genMin: 100, genMax: 300, group: "upscaling",  hrsMin: 10, hrsMax: 10, hourlyMult: 1.00, hiresOnly: true },
   ],
 };
 
-const CONFIG_KEY = "aier_cost_config_v1";
+const CONFIG_KEY = "aier_cost_config_v2";
 
 /* ---------------------------------------------------------------------------
    Helpers — NO rounding of intermediate values. Round only at display.
@@ -90,70 +96,68 @@ function pick(scenario, min, max) {
 
 /* ---------------------------------------------------------------------------
    Core engine.
-   mode "full"    : N total visuals; hiresN of them get the Hires (Touch Up /
-                    Upscale) phase, the rest stay Lowres.
-   mode "upscale" : upscale-only package — only the upscaling phase runs, for
-                    every image (N). No image development, no campaign cost.
+   mode "full" + scope "per_visual": every image = creative + revision +
+       prompting (all per image); Touch Up/Upscale per Hires image.
+   mode "full" + scope "campaign": 1 package = up to `package_size` images.
+       Each package has 1× creative + 1× revision. Prompting is per image (N).
+       packages = ceil(N / package_size). Touch Up/Upscale per Hires image.
+   mode "upscale": upscale-only package — only the upscaling phase, per image.
 --------------------------------------------------------------------------- */
 function computeScenario(cfg, rt, rates, scenario) {
   const genRate = rates.generating.selected * cfg.usd_to_idr;
   const upsRate = rates.upscaling.selected * cfg.usd_to_idr;
   const N = Math.max(1, rt.N);
   const upscaleOnly = rt.mode === "upscale";
+  const campaignMode = !upscaleOnly && rt.scopeMode === "campaign";
+  const packageSize = Math.max(1, Math.floor(cfg.campaign_package_size || 10));
+  const packages = Math.ceil(N / packageSize);
   const hiresN = upscaleOnly ? N : Math.min(Math.max(0, rt.hiresN), N);
 
-  let campaign_machine = 0, campaign_labor = 0;
-  let vAll_machine = 0, vAll_labor = 0;   // per-visual, applies to every visual (N)
-  let vHi_machine = 0, vHi_labor = 0;     // per-visual, Hires-only (hiresN)
+  let total_machine = 0, total_labor = 0, packagePart = 0, perImagePart = 0;
   const rows = [];
 
   cfg.phases.forEach((p) => {
-    if (upscaleOnly && p.group !== "upscaling") return; // upscale-only: skip all development phases
+    if (upscaleOnly && p.group !== "upscaling") return;
 
     const gen = pick(scenario, p.genMin, p.genMax);
     const hrs = pick(scenario, p.hrsMin, p.hrsMax);
     const rate = p.group === "generating" ? genRate : p.group === "upscaling" ? upsRate : 0;
-    const scope = (p.scopeToggle) ? rt.promptingScope : p.scope;
     const machine = gen * rate;
     const labor = hrs * cfg.base_hourly_rate_idr * p.hourlyMult;
+    const unit = machine + labor;
 
     let bucket, appliedN;
     if (upscaleOnly) {
-      // every image is upscaled
-      vAll_machine += machine; vAll_labor += labor; bucket = "per_image"; appliedN = N;
-    } else if (scope === "campaign") {
-      campaign_machine += machine; campaign_labor += labor; bucket = "campaign"; appliedN = 1;
+      bucket = "per_image"; appliedN = N;
     } else if (p.hiresOnly) {
-      vHi_machine += machine; vHi_labor += labor; bucket = "hires"; appliedN = hiresN;
+      bucket = "hires"; appliedN = hiresN;
+    } else if (p.perImage) {
+      bucket = "per_visual"; appliedN = N;
+    } else if (p.packageScoped && campaignMode) {
+      bucket = "package"; appliedN = packages;
     } else {
-      vAll_machine += machine; vAll_labor += labor; bucket = "per_visual"; appliedN = N;
+      bucket = "per_visual"; appliedN = N;
     }
 
+    const contribM = machine * appliedN;
+    const contribL = labor * appliedN;
+    total_machine += contribM;
+    total_labor += contribL;
+    if (bucket === "package") packagePart += contribM + contribL;
+    else perImagePart += contribM + contribL;
+
     rows.push({ id: p.id, name: p.name, group: p.group, bucket, appliedN,
-      gen, hrs, rate, machine, labor, subtotalOnce: machine + labor });
+      gen, hrs, rate, machine, labor, subtotalOnce: unit, scaledSubtotal: unit * appliedN });
   });
 
-  const total_machine = campaign_machine + vAll_machine * N + vHi_machine * hiresN;
-  const total_labor = campaign_labor + vAll_labor * N + vHi_labor * hiresN;
   const total_internal = total_machine + total_labor;
   const cost_per_unit = total_internal / N;
-
-  const marginal_lowres = vAll_machine + vAll_labor;
-  const marginal_hires = vAll_machine + vAll_labor + vHi_machine + vHi_labor;
-  const campaignFixed = campaign_machine + campaign_labor;
-
-  const phaseRows = rows.map((r) => {
-    const scaled = r.subtotalOnce * r.appliedN;
-    return { ...r, scaledSubtotal: scaled, pctOfTotal: total_internal ? scaled / total_internal : 0 };
-  });
+  const phaseRows = rows.map((r) => ({ ...r, pctOfTotal: total_internal ? r.scaledSubtotal / total_internal : 0 }));
 
   return {
-    N, hiresN, lowresN: N - hiresN, upscaleOnly, genRate, upsRate,
-    total_machine, total_labor, total_internal, cost_per_unit,
-    marginal_lowres, marginal_hires, campaignFixed,
-    campaign_total: campaignFixed,
-    perVisual_total: total_internal - campaignFixed,
-    phaseRows,
+    N, hiresN, lowresN: N - hiresN, upscaleOnly, campaignMode, packages, packageSize,
+    genRate, upsRate, total_machine, total_labor, total_internal, cost_per_unit,
+    packagePart, perImagePart, phaseRows,
   };
 }
 
@@ -175,6 +179,17 @@ function NumInput({ value, onChange, step = 1, min, className = "" }) {
     <input type="number" value={value} step={step} min={min}
       onChange={(e) => onChange(e.target.value === "" ? "" : Number(e.target.value))}
       className={"num-input mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none " + className} />
+  );
+}
+
+function Segmented({ value, onChange, options }) {
+  return (
+    <div className="mt-1 grid gap-1 rounded-md bg-slate-100 p-1" style={{ gridTemplateColumns: `repeat(${options.length},1fr)` }}>
+      {options.map(([v, l]) => (
+        <button key={v} onClick={() => onChange(v)}
+          className={"rounded px-2 py-1.5 text-xs font-medium " + (value === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>{l}</button>
+      ))}
+    </div>
   );
 }
 
@@ -224,9 +239,9 @@ function App() {
   // Session inputs (NOT persisted)
   const [rt, setRt] = useState({
     mode: "full",           // full | upscale
+    scopeMode: "per_visual", // per_visual | campaign  (full mode only)
     N: 10,
     hiresN: 2,
-    promptingScope: "per_visual",
     projectName: "",
   });
 
@@ -247,7 +262,9 @@ function App() {
   }), [config, rt, rates]);
 
   const upscaleOnly = rt.mode === "upscale";
+  const campaignMode = !upscaleOnly && rt.scopeMode === "campaign";
   const unitLabel = upscaleOnly ? "gambar" : "visual";
+  const avg = results.avg;
 
   const warnings = useMemo(() => {
     const w = [];
@@ -262,6 +279,7 @@ function App() {
     });
     if (!(config.base_hourly_rate_idr > 0)) w.push("Base hourly rate harus > 0.");
     if (!(config.price_buffer_multiplier > 0)) w.push("Buffer multiplier harus > 0.");
+    if (!(config.campaign_package_size >= 1)) w.push("Maks image per paket harus ≥ 1.");
     return w;
   }, [config, rt, upscaleOnly, unitLabel]);
 
@@ -275,7 +293,6 @@ function App() {
   const resetConfig = () => { if (confirm("Reset semua konfigurasi ke default?")) setConfig(DEFAULT_CONFIG); };
 
   const buffer = config.price_buffer_multiplier;
-  const avg = results.avg;
 
   /* PDF export */
   const exportPDF = () => {
@@ -294,7 +311,9 @@ function App() {
 
     const setupTxt = upscaleOnly
       ? `Mode: Upscale only · ${rt.N} gambar · skenario ${bdScenario}`
-      : `Mode: Full · N=${rt.N} (${results.avg.hiresN} Hires / ${results.avg.lowresN} Lowres) · Prompting: ${rt.promptingScope} · skenario ${bdScenario}`;
+      : campaignMode
+        ? `Mode: Campaign · N=${rt.N} → ${avg.packages} paket (maks ${avg.packageSize}/paket) · ${avg.hiresN} Hires / ${avg.lowresN} Lowres · skenario ${bdScenario}`
+        : `Mode: Per-visual · N=${rt.N} (${avg.hiresN} Hires / ${avg.lowresN} Lowres) · skenario ${bdScenario}`;
     doc.setFontSize(10); doc.setFont(undefined, "bold");
     doc.text(setupTxt, 40, y); y += 8;
 
@@ -313,12 +332,15 @@ function App() {
       margin: { left: 40, right: 40 },
     });
 
+    const badge = (p) => p.bucket === "package" ? `paket x${p.appliedN}`
+      : p.bucket === "hires" ? `hires x${p.appliedN}`
+      : p.bucket === "per_image" ? `per-gambar x${p.appliedN}` : `per-visual x${p.appliedN}`;
+
     doc.autoTable({
       startY: doc.lastAutoTable.finalY + 16,
       head: [["Fase", "Scope", "Generates", "Machine", "Jam", "Labor", "Subtotal", "% total"]],
       body: r.phaseRows.map((p) => [
-        p.name,
-        p.bucket === "campaign" ? "campaign" : p.bucket === "hires" ? `hires x${p.appliedN}` : `per-${unitLabel} x${p.appliedN}`,
+        p.name, badge(p),
         p.gen ? Math.round(p.gen).toLocaleString("id-ID") : "-",
         p.machine ? idr(p.machine) : "-",
         p.hrs || "-",
@@ -345,17 +367,23 @@ function App() {
   }, [bdResult, sortByPct]);
 
   const bucketBadge = (p) => {
-    if (p.bucket === "campaign") return { txt: "campaign", cls: "bg-amber-100 text-amber-700" };
+    if (p.bucket === "package") return { txt: `paket ×${p.appliedN}`, cls: "bg-amber-100 text-amber-700" };
     if (p.bucket === "hires") return { txt: `hires ×${p.appliedN}`, cls: "bg-fuchsia-100 text-fuchsia-700" };
     if (p.bucket === "per_image") return { txt: `per-gambar ×${p.appliedN}`, cls: "bg-teal-100 text-teal-700" };
     return { txt: `per-visual ×${p.appliedN}`, cls: "bg-teal-100 text-teal-700" };
   };
 
+  const headerSetup = upscaleOnly
+    ? `${rt.N} gambar (upscale only)`
+    : campaignMode
+      ? `N=${rt.N} → ${avg.packages} paket (maks ${avg.packageSize}/paket) · ${avg.hiresN} Hires / ${avg.lowresN} Lowres`
+      : `N=${rt.N} (${avg.hiresN} Hires / ${avg.lowresN} Lowres)`;
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-6">
       <header className="mb-5">
         <h1 className="text-xl font-bold text-slate-800">AI Visual Production Cost Calculator</h1>
-        <p className="text-sm text-slate-500">Biaya produksi internal — v1. Mesin (generates) & tenaga kerja (jam) dipisah; campaign-level vs per-visual dibandingkan langsung.</p>
+        <p className="text-sm text-slate-500">Biaya produksi internal — v1. Mesin (generates) & tenaga kerja (jam) dipisah.</p>
       </header>
 
       {warnings.length > 0 && (
@@ -370,21 +398,33 @@ function App() {
         <div className="space-y-4">
           <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-4">
             <Field label="Mode perhitungan">
-              <div className="mt-1 grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
-                {[["full", "Full production"], ["upscale", "Upscale only"]].map(([v, l]) => (
-                  <button key={v} onClick={() => setRt({ ...rt, mode: v })}
-                    className={"rounded px-2 py-1.5 text-xs font-medium " + (rt.mode === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>
-                    {l}
-                  </button>
-                ))}
-              </div>
+              <Segmented value={rt.mode} onChange={(v) => setRt({ ...rt, mode: v })}
+                options={[["full", "Full production"], ["upscale", "Upscale only"]]} />
             </Field>
 
+            {!upscaleOnly && (
+              <Field label="Struktur biaya (scope)"
+                hint={campaignMode
+                  ? "Campaign: tiap paket berisi 1× Creative + 1× Concept + Prompting per image."
+                  : "Per-visual: tiap image berisi Creative + Concept + Prompting sendiri."}>
+                <Segmented value={rt.scopeMode} onChange={(v) => setRt({ ...rt, scopeMode: v })}
+                  options={[["per_visual", "Per-visual"], ["campaign", "Campaign"]]} />
+              </Field>
+            )}
+
             <Field label={upscaleOnly ? "Jumlah gambar (upscale)" : "Jumlah visual (N)"}
-              hint={upscaleOnly ? "Paket upscaling saja — tanpa developing image." : undefined}>
+              hint={upscaleOnly ? "Paket upscaling saja — tanpa developing image."
+                : campaignMode ? `→ ${avg.packages} paket (maks ${avg.packageSize} image / paket).` : undefined}>
               <NumInput value={rt.N} min={1}
                 onChange={(v) => setRt((s) => { const N = v === "" ? 1 : Math.max(1, Math.floor(v)); return { ...s, N, hiresN: Math.min(s.hiresN, N) }; })} />
             </Field>
+
+            {campaignMode && (
+              <Field label="Maks image per paket">
+                <NumInput value={config.campaign_package_size} min={1}
+                  onChange={(v) => setCfg({ campaign_package_size: v === "" ? 1 : Math.max(1, Math.floor(v)) })} />
+              </Field>
+            )}
 
             {!upscaleOnly && (
               <Field label="Berapa yang Hires?" hint={`0–${rt.N}. Sisanya Lowres (tanpa Touch Up/Upscale). Saat ini: ${avg.hiresN} Hires · ${avg.lowresN} Lowres.`}>
@@ -393,22 +433,7 @@ function App() {
               </Field>
             )}
 
-            {!upscaleOnly && (
-              <Field label="Scope Prompting Day" hint="Default per-visual (per image). Campaign hanya untuk pembanding = dihitung sekali.">
-                <div className="mt-1 grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
-                  {[["per_visual", "Per-visual"], ["campaign", "Campaign"]].map(([v, l]) => (
-                    <button key={v} onClick={() => setRt({ ...rt, promptingScope: v })}
-                      className={"rounded px-2 py-1.5 text-xs font-medium " + (rt.promptingScope === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>
-                      {l}
-                    </button>
-                  ))}
-                </div>
-              </Field>
-            )}
-
-            <button onClick={exportPDF} className="w-full rounded-md bg-indigo-600 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
-              ⬇ Export PDF
-            </button>
+            <button onClick={exportPDF} className="w-full rounded-md bg-indigo-600 py-2 text-sm font-semibold text-white hover:bg-indigo-700">⬇ Export PDF</button>
             <Field label="Nama proyek / campaign" hint="Muncul sebagai judul di PDF & nama file.">
               <input value={rt.projectName} onChange={(e) => setRt({ ...rt, projectName: e.target.value })}
                 placeholder="mis. Campaign Ramadan 2026"
@@ -469,6 +494,7 @@ function App() {
             <div className="space-y-3">
               <Field label="USD → IDR"><NumInput value={config.usd_to_idr} step={100} onChange={(v) => setCfg({ usd_to_idr: v || 0 })} /></Field>
               <Field label="Base hourly rate (IDR)"><NumInput value={config.base_hourly_rate_idr} step={5000} onChange={(v) => setCfg({ base_hourly_rate_idr: v || 0 })} /></Field>
+              <Field label="Maks image per paket (mode campaign)"><NumInput value={config.campaign_package_size} min={1} onChange={(v) => setCfg({ campaign_package_size: v === "" ? 1 : Math.max(1, Math.floor(v)) })} /></Field>
               <button onClick={resetConfig} className="w-full rounded-md border border-slate-300 py-1.5 text-xs text-slate-500 hover:bg-slate-50">Reset ke default</button>
             </div>
           </Section>
@@ -476,11 +502,9 @@ function App() {
 
         {/* ---------------- OUTPUTS ---------------- */}
         <div className="space-y-5">
-          {/* Total block — 3 angka: total internal, cost per unit, buffered */}
+          {/* Total block */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
-            <h2 className="mb-3 text-sm font-semibold text-slate-500">
-              Total biaya internal · skenario average · {upscaleOnly ? `${rt.N} gambar (upscale only)` : `N=${rt.N} (${avg.hiresN} Hires / ${avg.lowresN} Lowres)`}
-            </h2>
+            <h2 className="mb-3 text-sm font-semibold text-slate-500">Total biaya internal · skenario average · {headerSetup}</h2>
             <div className="text-4xl font-extrabold tabular-nums text-slate-800">{idr(avg.total_internal)}</div>
             <div className="mt-1 text-xs text-slate-400">Range: {idr(results.min.total_internal)} – {idr(results.max.total_internal)}</div>
 
@@ -507,7 +531,7 @@ function App() {
             </div>
           </div>
 
-          {/* Breakdown — persis di bawah blok total */}
+          {/* Breakdown */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-sm font-semibold text-slate-500">Breakdown fase</h2>
@@ -566,7 +590,9 @@ function App() {
             <p className="mt-2 text-[11px] text-slate-400">
               {upscaleOnly
                 ? "Mode upscale only: hanya fase Touch Up/Upscale, dihitung per gambar."
-                : "Fase per-visual dikali N; fase Hires (Touch Up/Upscale) dikali jumlah Hires; fase campaign dihitung sekali."}
+                : campaignMode
+                  ? `Mode campaign: Creative & Concept dihitung per paket (×${avg.packages}); Prompting per image (×${rt.N}); Touch Up/Upscale per Hires (×${avg.hiresN}).`
+                  : `Mode per-visual: Creative, Concept & Prompting dihitung per image (×${rt.N}); Touch Up/Upscale per Hires (×${avg.hiresN}).`}
             </p>
           </div>
 
@@ -578,10 +604,10 @@ function App() {
                 <div className="mb-1 text-xs font-medium text-slate-600">Mesin vs Tenaga kerja</div>
                 <Bar a={avg.total_machine} b={avg.total_labor} aLabel="Machine" bLabel="Labor" aColor="bg-indigo-500" bColor="bg-slate-400" />
               </div>
-              {!upscaleOnly && (
+              {campaignMode && (
                 <div>
-                  <div className="mb-1 text-xs font-medium text-slate-600">Campaign-level vs Per-visual</div>
-                  <Bar a={avg.campaign_total} b={avg.perVisual_total} aLabel="Campaign (sekali)" bLabel="Per-visual" aColor="bg-amber-500" bColor="bg-teal-500" />
+                  <div className="mb-1 text-xs font-medium text-slate-600">Per paket vs Per-image</div>
+                  <Bar a={avg.packagePart} b={avg.perImagePart} aLabel={`Paket (×${avg.packages})`} bLabel="Per-image" aColor="bg-amber-500" bColor="bg-teal-500" />
                 </div>
               )}
             </div>
