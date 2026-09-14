@@ -419,13 +419,6 @@ function App() {
                 onChange={(v) => setRt((s) => { const N = v === "" ? 1 : Math.max(1, Math.floor(v)); return { ...s, N, hiresN: Math.min(s.hiresN, N) }; })} />
             </Field>
 
-            {campaignMode && (
-              <Field label="Maks image per paket">
-                <NumInput value={config.campaign_package_size} min={1}
-                  onChange={(v) => setCfg({ campaign_package_size: v === "" ? 1 : Math.max(1, Math.floor(v)) })} />
-              </Field>
-            )}
-
             {!upscaleOnly && (
               <Field label="Berapa yang Hires?" hint={`0–${rt.N}. Sisanya Lowres (tanpa Touch Up/Upscale). Saat ini: ${avg.hiresN} Hires · ${avg.lowresN} Lowres.`}>
                 <NumInput value={rt.hiresN} min={0}
