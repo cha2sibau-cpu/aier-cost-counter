@@ -226,7 +226,7 @@ function App() {
     mode: "full",           // full | upscale
     N: 10,
     hiresN: 2,
-    promptingScope: "campaign",
+    promptingScope: "per_visual",
     projectName: "",
   });
 
@@ -394,9 +394,9 @@ function App() {
             )}
 
             {!upscaleOnly && (
-              <Field label="Scope Prompting Day" hint="Campaign = sekali saja. Per-visual = scale dengan N.">
+              <Field label="Scope Prompting Day" hint="Default per-visual (per image). Campaign hanya untuk pembanding = dihitung sekali.">
                 <div className="mt-1 grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
-                  {[["campaign", "Campaign"], ["per_visual", "Per-visual"]].map(([v, l]) => (
+                  {[["per_visual", "Per-visual"], ["campaign", "Campaign"]].map(([v, l]) => (
                     <button key={v} onClick={() => setRt({ ...rt, promptingScope: v })}
                       className={"rounded px-2 py-1.5 text-xs font-medium " + (rt.promptingScope === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>
                       {l}
