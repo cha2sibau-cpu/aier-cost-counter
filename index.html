@@ -51,7 +51,6 @@ const DEFAULT_CONFIG = {
     { id: "creative",  name: "Creative Conception", genMin: 100, genMax: 250, group: "generating", hrsMin: 4,  hrsMax: 10, scope: "campaign",   hourlyMult: 1.25 },
     { id: "revision",  name: "Concept Revision",    genMin: 50,  genMax: 125, group: "generating", hrsMin: 8,  hrsMax: 12, scope: "campaign",   hourlyMult: 1.00 },
     { id: "prompting", name: "Prompting Day",       genMin: 200, genMax: 400, group: "generating", hrsMin: 4,  hrsMax: 10, scope: "campaign",   hourlyMult: 1.00, scopeToggle: true },
-    { id: "photoshoot",name: "Photoshoot Day",      genMin: 0,   genMax: 0,   group: "none",       hrsMin: 10, hrsMax: 10, scope: "campaign",   hourlyMult: 1.00, optional: true },
     { id: "touchup",   name: "Touch Up / Upscale",  genMin: 100, genMax: 300, group: "upscaling",  hrsMin: 10, hrsMax: 10, scope: "per_visual", hourlyMult: 1.00, hiresOnly: true },
   ],
 };
@@ -90,36 +89,39 @@ function pick(scenario, min, max) {
 }
 
 /* ---------------------------------------------------------------------------
-   Core engine. N total visuals; hiresN of them get the Hires (Touch Up /
-   Upscale) phase, the rest stay Lowres. Machine & labor kept separate;
-   campaign-level vs per-visual kept separate.
+   Core engine.
+   mode "full"    : N total visuals; hiresN of them get the Hires (Touch Up /
+                    Upscale) phase, the rest stay Lowres.
+   mode "upscale" : upscale-only package — only the upscaling phase runs, for
+                    every image (N). No image development, no campaign cost.
 --------------------------------------------------------------------------- */
 function computeScenario(cfg, rt, rates, scenario) {
   const genRate = rates.generating.selected * cfg.usd_to_idr;
   const upsRate = rates.upscaling.selected * cfg.usd_to_idr;
   const N = Math.max(1, rt.N);
-  const hiresN = Math.min(Math.max(0, rt.hiresN), N);
+  const upscaleOnly = rt.mode === "upscale";
+  const hiresN = upscaleOnly ? N : Math.min(Math.max(0, rt.hiresN), N);
 
   let campaign_machine = 0, campaign_labor = 0;
-  let vAll_machine = 0, vAll_labor = 0;     // per-visual, applies to every visual (N)
-  let vHi_machine = 0, vHi_labor = 0;       // per-visual, Hires-only (hiresN)
+  let vAll_machine = 0, vAll_labor = 0;   // per-visual, applies to every visual (N)
+  let vHi_machine = 0, vHi_labor = 0;     // per-visual, Hires-only (hiresN)
   const rows = [];
 
   cfg.phases.forEach((p) => {
-    if (p.optional && !rt.photoshootOn) return; // Photoshoot toggle
+    if (upscaleOnly && p.group !== "upscaling") return; // upscale-only: skip all development phases
 
     const gen = pick(scenario, p.genMin, p.genMax);
     const hrs = pick(scenario, p.hrsMin, p.hrsMax);
     const rate = p.group === "generating" ? genRate : p.group === "upscaling" ? upsRate : 0;
-
-    // Prompting Day scope is user-switchable
     const scope = (p.scopeToggle) ? rt.promptingScope : p.scope;
-
     const machine = gen * rate;
     const labor = hrs * cfg.base_hourly_rate_idr * p.hourlyMult;
 
     let bucket, appliedN;
-    if (scope === "campaign") {
+    if (upscaleOnly) {
+      // every image is upscaled
+      vAll_machine += machine; vAll_labor += labor; bucket = "per_image"; appliedN = N;
+    } else if (scope === "campaign") {
       campaign_machine += machine; campaign_labor += labor; bucket = "campaign"; appliedN = 1;
     } else if (p.hiresOnly) {
       vHi_machine += machine; vHi_labor += labor; bucket = "hires"; appliedN = hiresN;
@@ -131,35 +133,24 @@ function computeScenario(cfg, rt, rates, scenario) {
       gen, hrs, rate, machine, labor, subtotalOnce: machine + labor });
   });
 
-  const campaign_extra = Number(rt.photoshootExtra) > 0 ? Number(rt.photoshootExtra) : 0;
-
   const total_machine = campaign_machine + vAll_machine * N + vHi_machine * hiresN;
   const total_labor = campaign_labor + vAll_labor * N + vHi_labor * hiresN;
-  const total_internal = total_machine + total_labor + campaign_extra;
-  const buffered_total = total_internal * cfg.price_buffer_multiplier;
-  const cost_per_visual = total_internal / N;
+  const total_internal = total_machine + total_labor;
+  const cost_per_unit = total_internal / N;
 
-  const marginal_lowres = vAll_machine + vAll_labor;                       // +1 lowres visual
-  const marginal_hires = vAll_machine + vAll_labor + vHi_machine + vHi_labor; // +1 hires visual
-
-  const campaignFixed = campaign_machine + campaign_labor + campaign_extra;
-  const blendedMarginal = (vAll_machine + vAll_labor) + (vHi_machine + vHi_labor) * (hiresN / N);
+  const marginal_lowres = vAll_machine + vAll_labor;
+  const marginal_hires = vAll_machine + vAll_labor + vHi_machine + vHi_labor;
+  const campaignFixed = campaign_machine + campaign_labor;
 
   const phaseRows = rows.map((r) => {
     const scaled = r.subtotalOnce * r.appliedN;
     return { ...r, scaledSubtotal: scaled, pctOfTotal: total_internal ? scaled / total_internal : 0 };
   });
-  if (campaign_extra > 0) {
-    phaseRows.push({ id: "photoshoot_extra", name: "Photoshoot (biaya tambahan)", group: "other",
-      bucket: "campaign", appliedN: 1, gen: 0, hrs: 0, rate: 0, machine: 0, labor: 0,
-      subtotalOnce: campaign_extra, scaledSubtotal: campaign_extra,
-      pctOfTotal: total_internal ? campaign_extra / total_internal : 0 });
-  }
 
   return {
-    N, hiresN, lowresN: N - hiresN, genRate, upsRate,
-    total_machine, total_labor, total_internal, buffered_total, cost_per_visual,
-    marginal_lowres, marginal_hires, campaignFixed, blendedMarginal,
+    N, hiresN, lowresN: N - hiresN, upscaleOnly, genRate, upsRate,
+    total_machine, total_labor, total_internal, cost_per_unit,
+    marginal_lowres, marginal_hires, campaignFixed,
     campaign_total: campaignFixed,
     perVisual_total: total_internal - campaignFixed,
     phaseRows,
@@ -187,20 +178,6 @@ function NumInput({ value, onChange, step = 1, min, className = "" }) {
   );
 }
 
-function Toggle({ checked, onChange, label, sub }) {
-  return (
-    <button type="button" onClick={() => onChange(!checked)} className="flex items-center gap-3 w-full text-left">
-      <span className={"relative inline-flex h-5 w-9 shrink-0 rounded-full transition " + (checked ? "bg-indigo-600" : "bg-slate-300")}>
-        <span className={"absolute top-0.5 h-4 w-4 rounded-full bg-white transition " + (checked ? "left-4" : "left-0.5")} />
-      </span>
-      <span>
-        <span className="text-sm font-medium text-slate-700">{label}</span>
-        {sub && <span className="block text-[11px] text-slate-400">{sub}</span>}
-      </span>
-    </button>
-  );
-}
-
 function Section({ title, children, defaultOpen = false, note }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
@@ -211,16 +188,6 @@ function Section({ title, children, defaultOpen = false, note }) {
       </button>
       {note && !open && <p className="px-4 pb-3 -mt-1 text-[11px] text-slate-400">{note}</p>}
       {open && <div className="border-t border-slate-100 p-4">{children}</div>}
-    </div>
-  );
-}
-
-function StatCard({ label, value, sub, accent }) {
-  return (
-    <div className={"rounded-lg border p-4 " + (accent || "border-slate-200 bg-white")}>
-      <div className="text-xs font-medium text-slate-500">{label}</div>
-      <div className="mt-1 text-2xl font-bold tabular-nums text-slate-800">{value}</div>
-      {sub && <div className="mt-0.5 text-xs text-slate-400">{sub}</div>}
     </div>
   );
 }
@@ -242,38 +209,6 @@ function Bar({ a, b, aLabel, bLabel, aColor, bColor }) {
   );
 }
 
-/* Scaling curve — dual axis: total cost + cost/visual vs N 1..50
-   (menjaga proporsi Hires saat ini) */
-function ScalingCurve({ campaignFixed, marginal }) {
-  const W = 620, H = 260, padL = 64, padR = 64, padT = 16, padB = 34;
-  const maxN = 50;
-  const pts = [];
-  for (let n = 1; n <= maxN; n++) {
-    const total = campaignFixed + marginal * n;
-    pts.push({ n, total, cpv: total / n });
-  }
-  const maxTotal = Math.max(...pts.map((p) => p.total), 1);
-  const maxCpv = Math.max(...pts.map((p) => p.cpv), 1);
-  const x = (n) => padL + ((n - 1) / (maxN - 1)) * (W - padL - padR);
-  const yT = (v) => H - padB - (v / maxTotal) * (H - padT - padB);
-  const yC = (v) => H - padB - (v / maxCpv) * (H - padT - padB);
-  const line = (fy, key) => pts.map((p, i) => (i ? "L" : "M") + x(p.n).toFixed(1) + " " + fy(p[key]).toFixed(1)).join(" ");
-  const ticks = [1, 10, 20, 30, 40, 50];
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
-      {[0, .25, .5, .75, 1].map((f, i) => (
-        <line key={i} x1={padL} x2={W - padR} y1={padT + f * (H - padT - padB)} y2={padT + f * (H - padT - padB)} stroke="#eef0f3" strokeWidth="1" />
-      ))}
-      {ticks.map((t) => (<text key={t} x={x(t)} y={H - padB + 16} textAnchor="middle" className="fill-slate-400" fontSize="10">{t}</text>))}
-      <text x={(padL + W - padR) / 2} y={H - 2} textAnchor="middle" className="fill-slate-400" fontSize="10">Jumlah visual (N)</text>
-      <path d={line(yT, "total")} fill="none" stroke="#4f46e5" strokeWidth="2.5" />
-      <path d={line(yC, "cpv")} fill="none" stroke="#0d9488" strokeWidth="2.5" strokeDasharray="5 3" />
-      <text x={padL} y={11} className="fill-indigo-600" fontSize="10" fontWeight="600">■ Total (kiri)</text>
-      <text x={W - padR} y={11} textAnchor="end" className="fill-teal-600" fontSize="10" fontWeight="600">▪ Biaya / visual (kanan)</text>
-    </svg>
-  );
-}
-
 /* ---------------------------------------------------------------------------
    Root
 --------------------------------------------------------------------------- */
@@ -288,11 +223,10 @@ function App() {
 
   // Session inputs (NOT persisted)
   const [rt, setRt] = useState({
+    mode: "full",           // full | upscale
     N: 10,
     hiresN: 2,
-    photoshootOn: false,
     promptingScope: "campaign",
-    photoshootExtra: "",
     projectName: "",
   });
 
@@ -312,11 +246,13 @@ function App() {
     max: computeScenario(config, rt, rates, "max"),
   }), [config, rt, rates]);
 
+  const upscaleOnly = rt.mode === "upscale";
+  const unitLabel = upscaleOnly ? "gambar" : "visual";
+
   const warnings = useMemo(() => {
     const w = [];
-    if (rt.N < 1) w.push("Jumlah visual (N) harus ≥ 1.");
-    if (rt.hiresN < 0) w.push("Jumlah Hires tidak boleh negatif.");
-    if (rt.hiresN > rt.N) w.push("Jumlah Hires melebihi N — dibatasi otomatis ke N.");
+    if (rt.N < 1) w.push(`Jumlah ${unitLabel} harus ≥ 1.`);
+    if (!upscaleOnly && rt.hiresN > rt.N) w.push("Jumlah Hires melebihi N — dibatasi otomatis ke N.");
     [...config.engines.generating, ...config.engines.upscaling].forEach((e) => {
       if (!(Number(e.usd) > 0)) w.push(`Rate engine "${e.name}" harus > 0.`);
     });
@@ -325,8 +261,9 @@ function App() {
       if (p.hrsMin > p.hrsMax) w.push(`${p.name}: jam min > max.`);
     });
     if (!(config.base_hourly_rate_idr > 0)) w.push("Base hourly rate harus > 0.");
+    if (!(config.price_buffer_multiplier > 0)) w.push("Buffer multiplier harus > 0.");
     return w;
-  }, [config, rt]);
+  }, [config, rt, upscaleOnly, unitLabel]);
 
   /* config editing */
   const setCfg = (patch) => setConfig((c) => ({ ...c, ...patch }));
@@ -336,6 +273,9 @@ function App() {
   const removeEngine = (group, i) => setConfig((c) => ({ ...c, engines: { ...c.engines, [group]: c.engines[group].filter((_, j) => j !== i) } }));
   const setPhase = (i, patch) => setConfig((c) => ({ ...c, phases: c.phases.map((p, j) => j === i ? { ...p, ...patch } : p) }));
   const resetConfig = () => { if (confirm("Reset semua konfigurasi ke default?")) setConfig(DEFAULT_CONFIG); };
+
+  const buffer = config.price_buffer_multiplier;
+  const avg = results.avg;
 
   /* PDF export */
   const exportPDF = () => {
@@ -352,19 +292,19 @@ function App() {
     doc.text(`AI Visual Production Cost — biaya internal v1 · ${new Date().toLocaleString("id-ID")}`, 40, y);
     doc.setTextColor(0); y += 22;
 
+    const setupTxt = upscaleOnly
+      ? `Mode: Upscale only · ${rt.N} gambar · skenario ${bdScenario}`
+      : `Mode: Full · N=${rt.N} (${results.avg.hiresN} Hires / ${results.avg.lowresN} Lowres) · Prompting: ${rt.promptingScope} · skenario ${bdScenario}`;
     doc.setFontSize(10); doc.setFont(undefined, "bold");
-    doc.text(`Setup: N=${rt.N} (${results.avg.hiresN} Hires / ${results.avg.lowresN} Lowres) · Prompting: ${rt.promptingScope} · Photoshoot: ${rt.photoshootOn ? "on" : "off"} · skenario ${bdScenario}`, 40, y);
-    y += 8;
+    doc.text(setupTxt, 40, y); y += 8;
 
     doc.autoTable({
       startY: y + 6,
       head: [["Ringkasan", "Nilai"]],
       body: [
         ["Total internal (min / avg / max)", `${idr(results.min.total_internal)}  /  ${idr(results.avg.total_internal)}  /  ${idr(results.max.total_internal)}`],
-        ["Cost per visual (avg)", idr(results.avg.cost_per_visual)],
-        ["Marginal +1 Lowres", idr(results.avg.marginal_lowres)],
-        ["Marginal +1 Hires", idr(results.avg.marginal_hires)],
-        [`Buffered x${config.price_buffer_multiplier} (avg)`, idr(results.avg.buffered_total)],
+        [`Cost per ${unitLabel} (avg)`, idr(results.avg.cost_per_unit)],
+        [`Buffered x${buffer} (avg)`, idr(results.avg.total_internal * buffer)],
         ["Rate generating / upscaling", `${idr(results.avg.genRate)}  /  ${idr(results.avg.upsRate)} per generate`],
       ],
       theme: "grid", styles: { fontSize: 9, cellPadding: 5 },
@@ -378,7 +318,7 @@ function App() {
       head: [["Fase", "Scope", "Generates", "Machine", "Jam", "Labor", "Subtotal", "% total"]],
       body: r.phaseRows.map((p) => [
         p.name,
-        p.bucket === "campaign" ? "campaign" : p.bucket === "hires" ? `hires x${p.appliedN}` : `per-visual x${p.appliedN}`,
+        p.bucket === "campaign" ? "campaign" : p.bucket === "hires" ? `hires x${p.appliedN}` : `per-${unitLabel} x${p.appliedN}`,
         p.gen ? Math.round(p.gen).toLocaleString("id-ID") : "-",
         p.machine ? idr(p.machine) : "-",
         p.hrs || "-",
@@ -404,10 +344,10 @@ function App() {
     return rows;
   }, [bdResult, sortByPct]);
 
-  const avg = results.avg;
   const bucketBadge = (p) => {
     if (p.bucket === "campaign") return { txt: "campaign", cls: "bg-amber-100 text-amber-700" };
     if (p.bucket === "hires") return { txt: `hires ×${p.appliedN}`, cls: "bg-fuchsia-100 text-fuchsia-700" };
+    if (p.bucket === "per_image") return { txt: `per-gambar ×${p.appliedN}`, cls: "bg-teal-100 text-teal-700" };
     return { txt: `per-visual ×${p.appliedN}`, cls: "bg-teal-100 text-teal-700" };
   };
 
@@ -429,35 +369,42 @@ function App() {
         {/* ---------------- INPUTS ---------------- */}
         <div className="space-y-4">
           <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-4">
-            <Field label="Jumlah visual (N)">
-              <NumInput value={rt.N} min={1}
-                onChange={(v) => setRt((s) => { const N = v === "" ? 1 : Math.max(1, Math.floor(v)); return { ...s, N, hiresN: Math.min(s.hiresN, N) }; })} />
-            </Field>
-
-            <Field label="Berapa yang Hires?" hint={`0–${rt.N}. Sisanya Lowres (tanpa Touch Up/Upscale). Saat ini: ${avg.hiresN} Hires · ${avg.lowresN} Lowres.`}>
-              <NumInput value={rt.hiresN} min={0}
-                onChange={(v) => setRt((s) => ({ ...s, hiresN: v === "" ? 0 : Math.min(Math.max(0, Math.floor(v)), s.N) }))} />
-            </Field>
-
-            <div className="rounded-md bg-slate-50 p-3">
-              <Toggle checked={rt.photoshootOn} onChange={(v) => setRt({ ...rt, photoshootOn: v })}
-                label="Photoshoot Day" sub="Off default · +10 jam (campaign)" />
-            </div>
-
-            <Field label="Scope Prompting Day" hint="Campaign = sekali saja. Per-visual = scale dengan N.">
+            <Field label="Mode perhitungan">
               <div className="mt-1 grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
-                {[["campaign", "Campaign"], ["per_visual", "Per-visual"]].map(([v, l]) => (
-                  <button key={v} onClick={() => setRt({ ...rt, promptingScope: v })}
-                    className={"rounded px-2 py-1.5 text-xs font-medium " + (rt.promptingScope === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>
+                {[["full", "Full production"], ["upscale", "Upscale only"]].map(([v, l]) => (
+                  <button key={v} onClick={() => setRt({ ...rt, mode: v })}
+                    className={"rounded px-2 py-1.5 text-xs font-medium " + (rt.mode === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>
                     {l}
                   </button>
                 ))}
               </div>
             </Field>
 
-            <Field label="Biaya Photoshoot tambahan (IDR, opsional)" hint="Ikut ditambahkan ke total (campaign-level).">
-              <NumInput value={rt.photoshootExtra} min={0} step={100000} onChange={(v) => setRt({ ...rt, photoshootExtra: v })} />
+            <Field label={upscaleOnly ? "Jumlah gambar (upscale)" : "Jumlah visual (N)"}
+              hint={upscaleOnly ? "Paket upscaling saja — tanpa developing image." : undefined}>
+              <NumInput value={rt.N} min={1}
+                onChange={(v) => setRt((s) => { const N = v === "" ? 1 : Math.max(1, Math.floor(v)); return { ...s, N, hiresN: Math.min(s.hiresN, N) }; })} />
             </Field>
+
+            {!upscaleOnly && (
+              <Field label="Berapa yang Hires?" hint={`0–${rt.N}. Sisanya Lowres (tanpa Touch Up/Upscale). Saat ini: ${avg.hiresN} Hires · ${avg.lowresN} Lowres.`}>
+                <NumInput value={rt.hiresN} min={0}
+                  onChange={(v) => setRt((s) => ({ ...s, hiresN: v === "" ? 0 : Math.min(Math.max(0, Math.floor(v)), s.N) }))} />
+              </Field>
+            )}
+
+            {!upscaleOnly && (
+              <Field label="Scope Prompting Day" hint="Campaign = sekali saja. Per-visual = scale dengan N.">
+                <div className="mt-1 grid grid-cols-2 gap-1 rounded-md bg-slate-100 p-1">
+                  {[["campaign", "Campaign"], ["per_visual", "Per-visual"]].map(([v, l]) => (
+                    <button key={v} onClick={() => setRt({ ...rt, promptingScope: v })}
+                      className={"rounded px-2 py-1.5 text-xs font-medium " + (rt.promptingScope === v ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500")}>
+                      {l}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+            )}
 
             <button onClick={exportPDF} className="w-full rounded-md bg-indigo-600 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
               ⬇ Export PDF
@@ -522,7 +469,6 @@ function App() {
             <div className="space-y-3">
               <Field label="USD → IDR"><NumInput value={config.usd_to_idr} step={100} onChange={(v) => setCfg({ usd_to_idr: v || 0 })} /></Field>
               <Field label="Base hourly rate (IDR)"><NumInput value={config.base_hourly_rate_idr} step={5000} onChange={(v) => setCfg({ base_hourly_rate_idr: v || 0 })} /></Field>
-              <Field label="Price buffer multiplier" hint="Hanya ke angka uang final. Tidak ke generate/jam."><NumInput value={config.price_buffer_multiplier} step={0.05} onChange={(v) => setCfg({ price_buffer_multiplier: v || 0 })} /></Field>
               <button onClick={resetConfig} className="w-full rounded-md border border-slate-300 py-1.5 text-xs text-slate-500 hover:bg-slate-50">Reset ke default</button>
             </div>
           </Section>
@@ -530,40 +476,38 @@ function App() {
 
         {/* ---------------- OUTPUTS ---------------- */}
         <div className="space-y-5">
-          {/* Headline */}
+          {/* Total block — 3 angka: total internal, cost per unit, buffered */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
-            <h2 className="mb-3 text-sm font-semibold text-slate-500">Total biaya internal · skenario average · N={rt.N} ({avg.hiresN} Hires / {avg.lowresN} Lowres)</h2>
+            <h2 className="mb-3 text-sm font-semibold text-slate-500">
+              Total biaya internal · skenario average · {upscaleOnly ? `${rt.N} gambar (upscale only)` : `N=${rt.N} (${avg.hiresN} Hires / ${avg.lowresN} Lowres)`}
+            </h2>
             <div className="text-4xl font-extrabold tabular-nums text-slate-800">{idr(avg.total_internal)}</div>
             <div className="mt-1 text-xs text-slate-400">Range: {idr(results.min.total_internal)} – {idr(results.max.total_internal)}</div>
 
-            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <StatCard label="Cost per visual" value={idr(avg.cost_per_visual)} sub={`total ÷ ${rt.N}`} />
-              <StatCard label="Marginal +1 Lowres" value={idr(avg.marginal_lowres)} sub="tambah 1 visual lowres" accent="border-teal-200 bg-teal-50" />
-              <StatCard label="Marginal +1 Hires" value={idr(avg.marginal_hires)} sub="tambah 1 visual hires" accent="border-fuchsia-200 bg-fuchsia-50" />
-            </div>
-
-            <div className="mt-3 rounded-lg border border-dashed border-amber-300 bg-amber-50/60 p-3">
-              <div className="text-xs font-medium text-amber-700">Buffered ×{config.price_buffer_multiplier} — <span className="font-normal">bukan biaya internal aktual</span></div>
-              <div className="text-xl font-bold tabular-nums text-amber-800">{idr(avg.buffered_total)}</div>
-            </div>
-          </div>
-
-          {/* Split summary */}
-          <div className="rounded-xl border border-slate-200 bg-white p-5">
-            <h2 className="mb-3 text-sm font-semibold text-slate-500">Komposisi biaya (average)</h2>
-            <div className="space-y-4">
-              <div>
-                <div className="mb-1 text-xs font-medium text-slate-600">Mesin vs Tenaga kerja</div>
-                <Bar a={avg.total_machine} b={avg.total_labor} aLabel="Machine" bLabel="Labor" aColor="bg-indigo-500" bColor="bg-slate-400" />
+            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-lg border border-slate-200 bg-white p-4">
+                <div className="text-xs font-medium text-slate-500">Cost per {unitLabel}</div>
+                <div className="mt-1 text-2xl font-bold tabular-nums text-slate-800">{idr(avg.cost_per_unit)}</div>
+                <div className="mt-0.5 text-xs text-slate-400">total ÷ {rt.N}</div>
               </div>
-              <div>
-                <div className="mb-1 text-xs font-medium text-slate-600">Campaign-level vs Per-visual</div>
-                <Bar a={avg.campaign_total} b={avg.perVisual_total} aLabel="Campaign (sekali)" bLabel="Per-visual" aColor="bg-amber-500" bColor="bg-teal-500" />
+
+              <div className="rounded-lg border border-dashed border-amber-300 bg-amber-50 p-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-medium text-amber-700">Buffered</span>
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs text-amber-700">×</span>
+                    <input type="number" step="0.05" min="0" value={config.price_buffer_multiplier}
+                      onChange={(e) => setCfg({ price_buffer_multiplier: e.target.value === "" ? 0 : Number(e.target.value) })}
+                      className="num-input w-16 rounded border border-amber-300 bg-white px-2 py-1 text-xs text-right font-semibold text-amber-800 outline-none" />
+                  </div>
+                </div>
+                <div className="mt-1 text-2xl font-bold tabular-nums text-amber-800">{idr(avg.total_internal * buffer)}</div>
+                <div className="mt-0.5 text-xs text-amber-600/70">bukan biaya internal aktual</div>
               </div>
             </div>
           </div>
 
-          {/* Breakdown */}
+          {/* Breakdown — persis di bawah blok total */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-sm font-semibold text-slate-500">Breakdown fase</h2>
@@ -609,7 +553,7 @@ function App() {
                 </tbody>
                 <tfoot>
                   <tr className="border-t-2 border-slate-200 font-bold text-slate-800">
-                    <td className="py-2 text-left" colSpan="3">TOTAL INTERNAL (N={rt.N})</td>
+                    <td className="py-2 text-left" colSpan="3">TOTAL INTERNAL ({rt.N} {unitLabel})</td>
                     <td>{idr(bdResult.total_machine)}</td>
                     <td></td>
                     <td>{idr(bdResult.total_labor)}</td>
@@ -619,14 +563,28 @@ function App() {
                 </tfoot>
               </table>
             </div>
-            <p className="mt-2 text-[11px] text-slate-400">Fase per-visual dikali N; fase Hires (Touch Up/Upscale) dikali jumlah Hires; fase campaign dihitung sekali.</p>
+            <p className="mt-2 text-[11px] text-slate-400">
+              {upscaleOnly
+                ? "Mode upscale only: hanya fase Touch Up/Upscale, dihitung per gambar."
+                : "Fase per-visual dikali N; fase Hires (Touch Up/Upscale) dikali jumlah Hires; fase campaign dihitung sekali."}
+            </p>
           </div>
 
-          {/* Scaling curve */}
+          {/* Split summary */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
-            <h2 className="mb-1 text-sm font-semibold text-slate-500">Kurva skala (average), N = 1…50</h2>
-            <p className="mb-2 text-[11px] text-slate-400">Proporsi Hires saat ini dipertahankan. Cost/visual turun & mendatar saat biaya campaign teramortisasi.</p>
-            <ScalingCurve campaignFixed={avg.campaignFixed} marginal={avg.blendedMarginal} />
+            <h2 className="mb-3 text-sm font-semibold text-slate-500">Komposisi biaya (average)</h2>
+            <div className="space-y-4">
+              <div>
+                <div className="mb-1 text-xs font-medium text-slate-600">Mesin vs Tenaga kerja</div>
+                <Bar a={avg.total_machine} b={avg.total_labor} aLabel="Machine" bLabel="Labor" aColor="bg-indigo-500" bColor="bg-slate-400" />
+              </div>
+              {!upscaleOnly && (
+                <div>
+                  <div className="mb-1 text-xs font-medium text-slate-600">Campaign-level vs Per-visual</div>
+                  <Bar a={avg.campaign_total} b={avg.perVisual_total} aLabel="Campaign (sekali)" bLabel="Per-visual" aColor="bg-amber-500" bColor="bg-teal-500" />
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
