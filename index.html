@@ -27,16 +27,17 @@ const { useState, useEffect, useMemo } = React;
    layered on later without restructuring the cost engine.
 
    Phase billing flags:
-   - packageScoped : campaign mode → once per package; per-visual mode → tidak dihitung
+   - packageScoped : campaign mode → sekali per campaign, di-scale akar; per-visual → tidak dihitung
    - perImage      : always per image (every visual)
    - hiresOnly     : per Hires image only
 --------------------------------------------------------------------------- */
 const DEFAULT_CONFIG = {
   usd_to_idr: 18000,
-  price_buffer_multiplier: 1.5,
+  margin_percent: 25,            // margin on price: harga = cost / (1 - margin)
+  price_rounding_idr: 10000,     // pembulatan harga jual ke kelipatan terdekat
   base_hourly_rate_idr: 50000,
   rate_selection: "max_of_mean_median",
-  campaign_package_size: 10,
+  creative_scale_base_n: 10,     // volume acuan biaya kreatif (basis akar)
   engines: {
     generating: [
       { name: "Grok", usd: 0.020 },
@@ -69,6 +70,16 @@ const CONFIG_KEY = "aier_cost_config_v2";
 const idr = (n) => "Rp" + Math.round(n).toLocaleString("id-ID");
 const usd3 = (n) => "$" + Number(n).toFixed(3);
 const pct = (n) => (n * 100).toFixed(1) + "%";
+const num2 = (n) => Number(n).toLocaleString("id-ID", { maximumFractionDigits: 2 });
+
+// Harga jual = margin ON PRICE (bukan markup): harga = cost / (1 - margin).
+// Margin 25% → harga = cost / 0,75. Dibulatkan ke kelipatan terdekat.
+function sellPrice(cost, marginPct, roundTo) {
+  const m = Math.min(Math.max(Number(marginPct) || 0, 0), 99.99) / 100;
+  const raw = cost / (1 - m);
+  const step = Number(roundTo) > 0 ? Number(roundTo) : 0;
+  return step ? Math.round(raw / step) * step : raw;
+}
 
 function mean(arr) { return arr.reduce((a, b) => a + b, 0) / arr.length; }
 function median(arr) {
@@ -99,9 +110,14 @@ function pick(scenario, min, max) {
    mode "full" + scope "per_visual": every image = prompting only (per image);
        Touch Up/Upscale per Hires image. Creative Conception & Concept Revision
        tidak dihitung sama sekali di scope ini.
-   mode "full" + scope "campaign": 1 package = up to `package_size` images.
-       Each package has 1× creative + 1× revision. Prompting is per image (N).
-       packages = ceil(N / package_size). Touch Up/Upscale per Hires image.
+   mode "full" + scope "campaign": biaya kreatif (Creative Conception +
+       Concept Revision) dihitung SEKALI untuk seluruh campaign, di-scale akar
+       terhadap volume: faktor = √(N / creative_scale_base_n). Ini menghindari
+       cliff model lama (re-charge penuh tiap kelipatan paket) — riset memang
+       nambah seiring volume, tapi dengan diminishing returns, bukan linear.
+       CATATAN: eksponen 0,5 adalah asumsi pemodelan, belum tervalidasi data
+       riil — kalibrasi ulang setelah pilot. Prompting tetap per image (N),
+       Touch Up/Upscale per Hires image.
    mode "upscale": upscale-only package — only the upscaling phase, per image.
 --------------------------------------------------------------------------- */
 function computeScenario(cfg, rt, rates, scenario) {
@@ -110,11 +126,12 @@ function computeScenario(cfg, rt, rates, scenario) {
   const N = Math.max(1, rt.N);
   const upscaleOnly = rt.mode === "upscale";
   const campaignMode = !upscaleOnly && rt.scopeMode === "campaign";
-  const packageSize = Math.max(1, Math.floor(cfg.campaign_package_size || 10));
-  const packages = Math.ceil(N / packageSize);
+  const creativeBaseN = Math.max(1, Math.floor(cfg.creative_scale_base_n || 10));
+  // Faktor akar — pecahan, bukan jumlah paket bulat.
+  const creativeScale = Math.sqrt(N / creativeBaseN);
   const hiresN = upscaleOnly ? N : Math.min(Math.max(0, rt.hiresN), N);
 
-  let total_machine = 0, total_labor = 0, packagePart = 0, perImagePart = 0;
+  let total_machine = 0, total_labor = 0, creativePart = 0, perImagePart = 0;
   const rows = [];
 
   cfg.phases.forEach((p) => {
@@ -139,7 +156,7 @@ function computeScenario(cfg, rt, rates, scenario) {
     } else if (p.perImage) {
       bucket = "per_visual"; appliedN = N;
     } else if (p.packageScoped && campaignMode) {
-      bucket = "package"; appliedN = packages;
+      bucket = "creative"; appliedN = creativeScale;
     } else {
       bucket = "per_visual"; appliedN = N;
     }
@@ -148,7 +165,7 @@ function computeScenario(cfg, rt, rates, scenario) {
     const contribL = labor * appliedN;
     total_machine += contribM;
     total_labor += contribL;
-    if (bucket === "package") packagePart += contribM + contribL;
+    if (bucket === "creative") creativePart += contribM + contribL;
     else perImagePart += contribM + contribL;
 
     rows.push({ id: p.id, name: p.name, group: p.group, bucket, appliedN,
@@ -160,9 +177,9 @@ function computeScenario(cfg, rt, rates, scenario) {
   const phaseRows = rows.map((r) => ({ ...r, pctOfTotal: total_internal ? r.scaledSubtotal / total_internal : 0 }));
 
   return {
-    N, hiresN, lowresN: N - hiresN, upscaleOnly, campaignMode, packages, packageSize,
+    N, hiresN, lowresN: N - hiresN, upscaleOnly, campaignMode, creativeScale, creativeBaseN,
     genRate, upsRate, total_machine, total_labor, total_internal, cost_per_unit,
-    packagePart, perImagePart, phaseRows,
+    creativePart, perImagePart, phaseRows,
   };
 }
 
@@ -283,8 +300,8 @@ function App() {
       if (p.hrsMin > p.hrsMax) w.push(`${p.name}: jam min > max.`);
     });
     if (!(config.base_hourly_rate_idr > 0)) w.push("Base hourly rate harus > 0.");
-    if (!(config.price_buffer_multiplier > 0)) w.push("Buffer multiplier harus > 0.");
-    if (!(config.campaign_package_size >= 1)) w.push("Maks image per paket harus ≥ 1.");
+    if (!(config.margin_percent >= 0) || config.margin_percent >= 100) w.push("Margin harus ≥ 0% dan < 100%.");
+    if (!(config.creative_scale_base_n >= 1)) w.push("Volume acuan biaya kreatif harus ≥ 1.");
     return w;
   }, [config, rt, upscaleOnly, unitLabel]);
 
@@ -297,7 +314,8 @@ function App() {
   const setPhase = (i, patch) => setConfig((c) => ({ ...c, phases: c.phases.map((p, j) => j === i ? { ...p, ...patch } : p) }));
   const resetConfig = () => { if (confirm("Reset semua konfigurasi ke default?")) setConfig(DEFAULT_CONFIG); };
 
-  const buffer = config.price_buffer_multiplier;
+  const marginPct = config.margin_percent;
+  const priceOf = (cost) => sellPrice(cost, marginPct, config.price_rounding_idr);
 
   /* PDF export */
   const exportPDF = () => {
@@ -317,7 +335,7 @@ function App() {
     const setupTxt = upscaleOnly
       ? `Mode: Upscale only · ${rt.N} gambar · skenario ${bdScenario}`
       : campaignMode
-        ? `Mode: Campaign · N=${rt.N} → ${avg.packages} paket (maks ${avg.packageSize}/paket) · ${avg.hiresN} Hires / ${avg.lowresN} Lowres · skenario ${bdScenario}`
+        ? `Mode: Campaign · N=${rt.N} · biaya kreatif ×${num2(avg.creativeScale)} (√ dari basis ${avg.creativeBaseN}) · ${avg.hiresN} Hires / ${avg.lowresN} Lowres · skenario ${bdScenario}`
         : `Mode: Per-visual · N=${rt.N} (${avg.hiresN} Hires / ${avg.lowresN} Lowres) · skenario ${bdScenario}`;
     doc.setFontSize(10); doc.setFont(undefined, "bold");
     doc.text(setupTxt, 40, y); y += 8;
@@ -328,7 +346,8 @@ function App() {
       body: [
         ["Total internal (min / avg / max)", `${idr(results.min.total_internal)}  /  ${idr(results.avg.total_internal)}  /  ${idr(results.max.total_internal)}`],
         [`Cost per ${unitLabel} (avg)`, idr(results.avg.cost_per_unit)],
-        [`Buffered x${buffer} (avg)`, idr(results.avg.total_internal * buffer)],
+        [`Harga jual (margin ${marginPct}%, avg)`, idr(priceOf(results.avg.total_internal))],
+        [`Harga jual per ${unitLabel} (avg)`, idr(priceOf(results.avg.total_internal) / rt.N)],
         ["Rate generating / upscaling", `${idr(results.avg.genRate)}  /  ${idr(results.avg.upsRate)} per generate`],
       ],
       theme: "grid", styles: { fontSize: 9, cellPadding: 5 },
@@ -337,7 +356,7 @@ function App() {
       margin: { left: 40, right: 40 },
     });
 
-    const badge = (p) => p.bucket === "package" ? `paket x${p.appliedN}`
+    const badge = (p) => p.bucket === "creative" ? `kreatif x${num2(p.appliedN)}`
       : p.bucket === "hires" ? `hires x${p.appliedN}`
       : p.bucket === "per_image" ? `per-gambar x${p.appliedN}` : `per-visual x${p.appliedN}`;
 
@@ -372,7 +391,7 @@ function App() {
   }, [bdResult, sortByPct]);
 
   const bucketBadge = (p) => {
-    if (p.bucket === "package") return { txt: `paket ×${p.appliedN}`, cls: "bg-amber-100 text-amber-700" };
+    if (p.bucket === "creative") return { txt: `kreatif ×${num2(p.appliedN)}`, cls: "bg-amber-100 text-amber-700" };
     if (p.bucket === "hires") return { txt: `hires ×${p.appliedN}`, cls: "bg-fuchsia-100 text-fuchsia-700" };
     if (p.bucket === "per_image") return { txt: `per-gambar ×${p.appliedN}`, cls: "bg-teal-100 text-teal-700" };
     return { txt: `per-visual ×${p.appliedN}`, cls: "bg-teal-100 text-teal-700" };
@@ -381,7 +400,7 @@ function App() {
   const headerSetup = upscaleOnly
     ? `${rt.N} gambar (upscale only)`
     : campaignMode
-      ? `N=${rt.N} → ${avg.packages} paket (maks ${avg.packageSize}/paket) · ${avg.hiresN} Hires / ${avg.lowresN} Lowres`
+      ? `N=${rt.N} · kreatif ×${num2(avg.creativeScale)} · ${avg.hiresN} Hires / ${avg.lowresN} Lowres`
       : `N=${rt.N} (${avg.hiresN} Hires / ${avg.lowresN} Lowres)`;
 
   return (
@@ -410,7 +429,7 @@ function App() {
             {!upscaleOnly && (
               <Field label="Struktur biaya (scope)"
                 hint={campaignMode
-                  ? "Campaign: tiap paket berisi 1× Creative + 1× Concept + Prompting per image."
+                  ? "Campaign: Creative + Concept sekali untuk seluruh campaign, di-scale √(N/basis); Prompting tetap per image."
                   : "Per-visual: tiap image hanya Prompting Day + Touch Up/Upscale (tanpa Creative & Concept)."}>
                 <Segmented value={rt.scopeMode} onChange={(v) => setRt({ ...rt, scopeMode: v })}
                   options={[["per_visual", "Per-visual"], ["campaign", "Campaign"]]} />
@@ -419,7 +438,7 @@ function App() {
 
             <Field label={upscaleOnly ? "Jumlah gambar (upscale)" : "Jumlah visual (N)"}
               hint={upscaleOnly ? "Paket upscaling saja — tanpa developing image."
-                : campaignMode ? `→ ${avg.packages} paket (maks ${avg.packageSize} image / paket).` : undefined}>
+                : campaignMode ? `Biaya kreatif di-scale ×${num2(avg.creativeScale)} = √(${rt.N}/${avg.creativeBaseN}).` : undefined}>
               <NumInput value={rt.N} min={1}
                 onChange={(v) => setRt((s) => { const N = v === "" ? 1 : Math.max(1, Math.floor(v)); return { ...s, N, hiresN: Math.min(s.hiresN, N) }; })} />
             </Field>
@@ -492,7 +511,10 @@ function App() {
             <div className="space-y-3">
               <Field label="USD → IDR"><NumInput value={config.usd_to_idr} step={100} onChange={(v) => setCfg({ usd_to_idr: v || 0 })} /></Field>
               <Field label="Base hourly rate (IDR)"><NumInput value={config.base_hourly_rate_idr} step={5000} onChange={(v) => setCfg({ base_hourly_rate_idr: v || 0 })} /></Field>
-              <Field label="Maks image per paket (mode campaign)"><NumInput value={config.campaign_package_size} min={1} onChange={(v) => setCfg({ campaign_package_size: v === "" ? 1 : Math.max(1, Math.floor(v)) })} /></Field>
+              <Field label="Volume acuan biaya kreatif (N basis)" hint="Basis √: biaya kreatif ×√(N/basis). Default 10.">
+                <NumInput value={config.creative_scale_base_n} min={1} onChange={(v) => setCfg({ creative_scale_base_n: v === "" ? 1 : Math.max(1, Math.floor(v)) })} /></Field>
+              <Field label="Pembulatan harga jual (IDR)" hint="Harga dibulatkan ke kelipatan terdekat. 0 = tanpa pembulatan.">
+                <NumInput value={config.price_rounding_idr} min={0} step={1000} onChange={(v) => setCfg({ price_rounding_idr: v === "" ? 0 : Math.max(0, Math.floor(v)) })} /></Field>
               <button onClick={resetConfig} className="w-full rounded-md border border-slate-300 py-1.5 text-xs text-slate-500 hover:bg-slate-50">Reset ke default</button>
             </div>
           </Section>
@@ -515,16 +537,19 @@ function App() {
 
               <div className="rounded-lg border border-dashed border-amber-300 bg-amber-50 p-4">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-amber-700">Buffered</span>
+                  <span className="text-xs font-medium text-amber-700">Harga jual</span>
                   <div className="flex items-center gap-1">
-                    <span className="text-xs text-amber-700">×</span>
-                    <input type="number" step="0.05" min="0" value={config.price_buffer_multiplier}
-                      onChange={(e) => setCfg({ price_buffer_multiplier: e.target.value === "" ? 0 : Number(e.target.value) })}
-                      className="num-input w-16 rounded border border-amber-300 bg-white px-2 py-1 text-xs text-right font-semibold text-amber-800 outline-none" />
+                    <span className="text-xs text-amber-700">margin</span>
+                    <input type="number" step="1" min="0" max="99" value={config.margin_percent}
+                      onChange={(e) => setCfg({ margin_percent: e.target.value === "" ? 0 : Number(e.target.value) })}
+                      className="num-input w-14 rounded border border-amber-300 bg-white px-2 py-1 text-xs text-right font-semibold text-amber-800 outline-none" />
+                    <span className="text-xs text-amber-700">%</span>
                   </div>
                 </div>
-                <div className="mt-1 text-2xl font-bold tabular-nums text-amber-800">{idr(avg.total_internal * buffer)}</div>
-                <div className="mt-0.5 text-xs text-amber-600/70">bukan biaya internal aktual</div>
+                <div className="mt-1 text-2xl font-bold tabular-nums text-amber-800">{idr(priceOf(avg.total_internal))}</div>
+                <div className="mt-0.5 text-xs text-amber-600/70">
+                  {idr(priceOf(avg.total_internal) / rt.N)} / {unitLabel} · harga = cost ÷ {(1 - Math.min(Math.max(marginPct, 0), 99.99) / 100).toFixed(2).replace(".", ",")}
+                </div>
               </div>
             </div>
           </div>
@@ -589,7 +614,7 @@ function App() {
               {upscaleOnly
                 ? "Mode upscale only: hanya fase Touch Up/Upscale, dihitung per gambar."
                 : campaignMode
-                  ? `Mode campaign: Creative & Concept dihitung per paket (×${avg.packages}); Prompting per image (×${rt.N}); Touch Up/Upscale per Hires (×${avg.hiresN}).`
+                  ? `Mode campaign: Creative & Concept dihitung sekali lalu di-scale ×${num2(avg.creativeScale)} = √(${rt.N}/${avg.creativeBaseN}); Prompting per image (×${rt.N}); Touch Up/Upscale per Hires (×${avg.hiresN}).`
                   : `Mode per-visual: hanya Prompting Day per image (×${rt.N}) + Touch Up/Upscale per Hires (×${avg.hiresN}), termasuk labor cost keduanya. Creative Conception & Concept Revision tidak dihitung.`}
             </p>
           </div>
@@ -605,7 +630,7 @@ function App() {
               {campaignMode && (
                 <div>
                   <div className="mb-1 text-xs font-medium text-slate-600">Per paket vs Per-image</div>
-                  <Bar a={avg.packagePart} b={avg.perImagePart} aLabel={`Paket (×${avg.packages})`} bLabel="Per-image" aColor="bg-amber-500" bColor="bg-teal-500" />
+                  <Bar a={avg.creativePart} b={avg.perImagePart} aLabel={`Kreatif (×${num2(avg.creativeScale)})`} bLabel="Per-image" aColor="bg-amber-500" bColor="bg-teal-500" />
                 </div>
               )}
             </div>
