@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI Visual Production Cost Calculator</title>
+  <title>AIER - Cost Calculator v1</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
@@ -329,7 +329,7 @@ function App() {
     doc.setFontSize(16); doc.setFont(undefined, "bold");
     doc.text(name, 40, y); y += 18;
     doc.setFontSize(9); doc.setFont(undefined, "normal"); doc.setTextColor(120);
-    doc.text(`AI Visual Production Cost — biaya internal v1 · ${new Date().toLocaleString("id-ID")}`, 40, y);
+    doc.text(`AIER - Cost Calculator v1 · biaya internal · ${new Date().toLocaleString("id-ID")}`, 40, y);
     doc.setTextColor(0); y += 22;
 
     const setupTxt = upscaleOnly
@@ -406,7 +406,7 @@ function App() {
   return (
     <div className="mx-auto max-w-6xl px-4 py-6">
       <header className="mb-5">
-        <h1 className="text-xl font-bold text-slate-800">AI Visual Production Cost Calculator</h1>
+        <h1 className="text-xl font-bold text-slate-800">AIER - Cost Calculator v1</h1>
         <p className="text-sm text-slate-500">Biaya produksi internal — v1. Mesin (generates) & tenaga kerja (jam) dipisah.</p>
       </header>
 
