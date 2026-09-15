@@ -27,7 +27,7 @@ const { useState, useEffect, useMemo } = React;
    layered on later without restructuring the cost engine.
 
    Phase billing flags:
-   - packageScoped : campaign mode → once per package; per-visual mode → per image
+   - packageScoped : campaign mode → once per package; per-visual mode → tidak dihitung
    - perImage      : always per image (every visual)
    - hiresOnly     : per Hires image only
 --------------------------------------------------------------------------- */
@@ -96,8 +96,9 @@ function pick(scenario, min, max) {
 
 /* ---------------------------------------------------------------------------
    Core engine.
-   mode "full" + scope "per_visual": every image = creative + revision +
-       prompting (all per image); Touch Up/Upscale per Hires image.
+   mode "full" + scope "per_visual": every image = prompting only (per image);
+       Touch Up/Upscale per Hires image. Creative Conception & Concept Revision
+       tidak dihitung sama sekali di scope ini.
    mode "full" + scope "campaign": 1 package = up to `package_size` images.
        Each package has 1× creative + 1× revision. Prompting is per image (N).
        packages = ceil(N / package_size). Touch Up/Upscale per Hires image.
@@ -118,6 +119,10 @@ function computeScenario(cfg, rt, rates, scenario) {
 
   cfg.phases.forEach((p) => {
     if (upscaleOnly && p.group !== "upscaling") return;
+    // Per-visual scope hanya menghitung Prompting Day + Touch Up/Upscale (beserta
+    // labor-nya). Fase package-scoped (Creative Conception & Concept Revision)
+    // eksklusif untuk mode campaign.
+    if (!upscaleOnly && !campaignMode && p.packageScoped) return;
 
     const gen = pick(scenario, p.genMin, p.genMax);
     const hrs = pick(scenario, p.hrsMin, p.hrsMax);
@@ -406,7 +411,7 @@ function App() {
               <Field label="Struktur biaya (scope)"
                 hint={campaignMode
                   ? "Campaign: tiap paket berisi 1× Creative + 1× Concept + Prompting per image."
-                  : "Per-visual: tiap image berisi Creative + Concept + Prompting sendiri."}>
+                  : "Per-visual: tiap image hanya Prompting Day + Touch Up/Upscale (tanpa Creative & Concept)."}>
                 <Segmented value={rt.scopeMode} onChange={(v) => setRt({ ...rt, scopeMode: v })}
                   options={[["per_visual", "Per-visual"], ["campaign", "Campaign"]]} />
               </Field>
@@ -585,7 +590,7 @@ function App() {
                 ? "Mode upscale only: hanya fase Touch Up/Upscale, dihitung per gambar."
                 : campaignMode
                   ? `Mode campaign: Creative & Concept dihitung per paket (×${avg.packages}); Prompting per image (×${rt.N}); Touch Up/Upscale per Hires (×${avg.hiresN}).`
-                  : `Mode per-visual: Creative, Concept & Prompting dihitung per image (×${rt.N}); Touch Up/Upscale per Hires (×${avg.hiresN}).`}
+                  : `Mode per-visual: hanya Prompting Day per image (×${rt.N}) + Touch Up/Upscale per Hires (×${avg.hiresN}), termasuk labor cost keduanya. Creative Conception & Concept Revision tidak dihitung.`}
             </p>
           </div>
 
